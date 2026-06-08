@@ -1,0 +1,140 @@
+name: Build sing-box with V2Ray API
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_tag:
+        description: Exact SagerNet/sing-box tag, for example v1.13.13
+        required: true
+        type: string
+      build_revision:
+        description: Build revision for this upstream tag
+        required: true
+        default: "1"
+        type: string
+      targets:
+        description: Comma-separated targets
+        required: true
+        default: linux-amd64,linux-arm64,windows-amd64
+        type: string
+      prerelease:
+        description: Publish as a prerelease
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+concurrency:
+  group: build-${{ inputs.upstream_tag }}-${{ inputs.build_revision }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.prepare.outputs.matrix }}
+      version: ${{ steps.prepare.outputs.version }}
+      release_tag: ${{ steps.prepare.outputs.release_tag }}
+    steps:
+      - name: Prepare matrix
+        id: prepare
+        shell: bash
+        env:
+          UPSTREAM_TAG: ${{ inputs.upstream_tag }}
+          BUILD_REVISION: ${{ inputs.build_revision }}
+          TARGETS: ${{ inputs.targets }}
+        run: |
+          set -euo pipefail
+          [[ "$BUILD_REVISION" =~ ^[1-9][0-9]*$ ]] || { echo "build_revision must be a positive integer" >&2; exit 1; }
+          [[ -n "$UPSTREAM_TAG" && "$UPSTREAM_TAG" != *[[:space:]]* ]] || { echo "Invalid upstream_tag" >&2; exit 1; }
+
+          tag="${UPSTREAM_TAG#refs/tags/}"
+          git ls-remote --exit-code --tags https://github.com/SagerNet/sing-box.git "refs/tags/$tag" >/dev/null
+          version="${tag#v}"
+
+          matrix='[]'
+          IFS=',' read -ra requested <<<"$TARGETS"
+          for raw in "${requested[@]}"; do
+            target="$(xargs <<<"$raw")"
+            case "$target" in
+              linux-amd64|linux-arm64|windows-amd64) ;;
+              "") continue ;;
+              *) echo "Unsupported target: $target" >&2; exit 1 ;;
+            esac
+            matrix="$(jq -c --arg target "$target" '. + [$target] | unique' <<<"$matrix")"
+          done
+          [[ "$(jq length <<<"$matrix")" -gt 0 ]] || { echo "At least one target is required" >&2; exit 1; }
+
+          echo "matrix={\"target\":$matrix}" >>"$GITHUB_OUTPUT"
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+          echo "release_tag=v${version}-cx.${BUILD_REVISION}" >>"$GITHUB_OUTPUT"
+
+      - name: Refuse to overwrite a release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ steps.prepare.outputs.release_tag }}
+        run: |
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $RELEASE_TAG already exists. Increment build_revision." >&2
+            exit 1
+          fi
+
+  build:
+    needs: prepare
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.prepare.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+      - name: Build ${{ matrix.target }}
+        run: bash ./scripts/build.sh "${{ inputs.upstream_tag }}" "${{ matrix.target }}" "${{ inputs.build_revision }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sing-box-${{ matrix.target }}
+          path: |
+            dist/*-${{ matrix.target }}.*
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    needs: [prepare, build]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: sing-box-*
+          path: dist
+          merge-multiple: true
+      - name: Build manifest
+        run: |
+          cd dist
+          cat ./*.sha256 | sort -k2 >SHA256SUMS
+          jq -s --arg releaseTag "${{ needs.prepare.outputs.release_tag }}" \
+            '{schemaVersion: 1, core: "sing-box", releaseTag: $releaseTag, builds: .}' \
+            ./*.metadata.json >release-manifest.json
+      - uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: dist/*
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.prepare.outputs.release_tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          prerelease_flag=()
+          [[ "$PRERELEASE" == "true" ]] && prerelease_flag=(--prerelease)
+          gh release create "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "sing-box v${VERSION} with V2Ray API (build ${{ inputs.build_revision }})" \
+            --notes "Reproducible build of SagerNet/sing-box@${{ inputs.upstream_tag }} with with_v2ray_api appended." \
+            "${prerelease_flag[@]}" \
+            dist/*
