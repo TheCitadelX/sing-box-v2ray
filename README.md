@@ -12,8 +12,8 @@ Supported targets:
 Run **Actions -> Build sing-box with V2Ray API -> Run workflow**, enter an exact upstream tag and a build
 revision. Releases use the form `v1.13.13-cx.1` and are never overwritten by the workflow.
 
-Each release includes archives, build metadata, SHA256 checksums, a combined manifest, and GitHub provenance
-attestations.
+Each release includes archives, build metadata, SHA256 checksums, and a combined manifest. GitHub provenance
+attestations are added when the repository visibility and organization plan support them.
 
 ## Local build
 

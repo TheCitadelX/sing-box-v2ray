@@ -121,6 +121,7 @@ jobs:
             '{schemaVersion: 1, core: "sing-box", releaseTag: $releaseTag, builds: .}' \
             ./*.metadata.json >release-manifest.json
       - uses: actions/attest-build-provenance@v3
+        continue-on-error: true
         with:
           subject-path: dist/*
       - name: Publish release
